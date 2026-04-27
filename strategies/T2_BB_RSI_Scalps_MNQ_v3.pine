@@ -1,0 +1,151 @@
+// =============================================================================
+// T2: BB + RSI Scalps [MNQ] v3
+// =============================================================================
+// Adds Option A — EMA50/EMA100 trend regime filter with 3 modes:
+//   off            -> v2 behavior (baseline)
+//   block_counter  -> kill Setup A counter-trend (no A-long in downtrend,
+//                     no A-short in uptrend)
+//   smart          -> block_counter + flip Setup B from mean-reversion fade
+//                     into with-trend continuation (B-long uptrend only,
+//                     B-short downtrend only)
+//
+// Diagnosis recap:
+//   - SNAP1 showed long WR 28% / short WR 45% in a strong uptrend on MNQ.
+//     That asymmetry is regime, not noise -> counter-trend A trades bleed.
+//   - Setup B "midband fade" was suppressed in trends, missing the
+//     continuation pullback entries you wanted.
+//
+// All v2 logic is intact; the filter only gates entries. Toggle off to revert.
+// =============================================================================
+
+//@version=5
+strategy("T2: BB + RSI Scalps [MNQ] v3",
+     overlay              = true,
+     initial_capital      = 25000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     pyramiding           = 0,
+     commission_type      = strategy.commission.cash_per_contract,
+     commission_value     = 0.62,        // typical MNQ round-turn approx (adjust)
+     slippage             = 1,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true)
+
+// -------- INPUTS ------------------------------------------------------------
+grpCore   = "Core"
+bbLen     = input.int(20,  "BB Length",        minval=2, group=grpCore)
+bbMult    = input.float(2.0,"BB StdDev",       minval=0.1, step=0.1, group=grpCore)
+rsiLen    = input.int(14,  "RSI Length",       minval=2, group=grpCore)
+rsiOS     = input.int(30,  "RSI Oversold",     minval=1,  maxval=50, group=grpCore)
+rsiOB     = input.int(70,  "RSI Overbought",   minval=50, maxval=99, group=grpCore)
+
+grpSetup  = "Setups"
+useA      = input.bool(true, "Enable Setup A (BB extreme fade)", group=grpSetup)
+useB      = input.bool(true, "Enable Setup B (midband entry)",   group=grpSetup)
+
+grpRisk   = "Risk"
+atrLen    = input.int(14,    "ATR Length",      minval=2, group=grpRisk)
+stopATR   = input.float(1.5, "Stop x ATR",      minval=0.1, step=0.1, group=grpRisk)
+rr        = input.float(1.5, "Reward:Risk",     minval=0.1, step=0.1, group=grpRisk)
+
+grpFilter = "Trend Filter (v3)"
+fastLen   = input.int(50,  "Fast EMA",          minval=2, group=grpFilter)
+slowLen   = input.int(100, "Slow EMA",          minval=2, group=grpFilter)
+filterMode = input.string("smart", "Filter Mode",
+     options=["off","block_counter","smart"], group=grpFilter,
+     tooltip="off = v2 baseline | block_counter = kill counter-trend Setup A | smart = block_counter + require with-trend Setup B")
+
+grpSession = "Session"
+useSession = input.bool(false, "Restrict to session", group=grpSession)
+sessStr   = input.session("0930-1600", "Session (exchange tz)", group=grpSession)
+
+grpDebug  = "Debug"
+plotLevels= input.bool(true, "Plot BB / EMA",    group=grpDebug)
+showLabels= input.bool(true, "Show entry labels", group=grpDebug)
+
+// -------- INDICATORS --------------------------------------------------------
+basis  = ta.sma(close, bbLen)
+dev    = bbMult * ta.stdev(close, bbLen)
+upper  = basis + dev
+lower  = basis - dev
+
+rsi    = ta.rsi(close, rsiLen)
+atr    = ta.atr(atrLen)
+
+emaF   = ta.ema(close, fastLen)
+emaS   = ta.ema(close, slowLen)
+upTrend   = emaF > emaS
+downTrend = emaF < emaS
+
+// session gate
+inSess = useSession ? not na(time(timeframe.period, sessStr)) : true
+
+// -------- SIGNALS (v2 logic) ------------------------------------------------
+// Setup A — BB extreme fade with RSI confirmation (mean reversion)
+rawA_long  = useA and ta.crossover (close, lower) and rsi < rsiOS
+rawA_short = useA and ta.crossunder(close, upper) and rsi > rsiOB
+
+// Setup B — midband entry. v2 treated this as a fade through the basis with
+// RSI bias. v3 reinterprets it as a continuation pullback when smart mode is on.
+rawB_long  = useB and ta.crossover (close, basis) and rsi > 50
+rawB_short = useB and ta.crossunder(close, basis) and rsi < 50
+
+// -------- v3 FILTER ---------------------------------------------------------
+A_long  = rawA_long
+A_short = rawA_short
+B_long  = rawB_long
+B_short = rawB_short
+
+if filterMode == "block_counter"
+    // kill counter-trend A only; B unchanged
+    A_long  := rawA_long  and not downTrend
+    A_short := rawA_short and not upTrend
+
+if filterMode == "smart"
+    // block counter-trend A AND require with-trend B
+    A_long  := rawA_long  and not downTrend
+    A_short := rawA_short and not upTrend
+    B_long  := rawB_long  and upTrend
+    B_short := rawB_short and downTrend
+
+longSig  = inSess and (A_long  or B_long)
+shortSig = inSess and (A_short or B_short)
+
+// -------- ORDERS ------------------------------------------------------------
+// flat-only entries; opposite signal flips position naturally via strategy
+if longSig and strategy.position_size <= 0
+    stop = close - stopATR * atr
+    tp   = close + stopATR * atr * rr
+    strategy.entry("L", strategy.long)
+    strategy.exit("L-x", from_entry="L", stop=stop, limit=tp)
+
+if shortSig and strategy.position_size >= 0
+    stop = close + stopATR * atr
+    tp   = close - stopATR * atr * rr
+    strategy.entry("S", strategy.short)
+    strategy.exit("S-x", from_entry="S", stop=stop, limit=tp)
+
+// -------- VISUALS -----------------------------------------------------------
+plot(plotLevels ? basis : na, "BB Basis", color=color.new(color.gray,   0))
+plot(plotLevels ? upper : na, "BB Upper", color=color.new(color.teal,   0))
+plot(plotLevels ? lower : na, "BB Lower", color=color.new(color.teal,   0))
+plot(plotLevels ? emaF  : na, "EMA Fast", color=color.new(color.orange, 0))
+plot(plotLevels ? emaS  : na, "EMA Slow", color=color.new(color.purple, 0))
+
+bgcolor(filterMode == "smart" and upTrend ? color.new(color.green, 92) : filterMode == "smart" and downTrend ? color.new(color.red, 92) : na)
+
+if showLabels and A_long
+    label.new(bar_index, low,  "A▲", style=label.style_label_up,   color=color.teal,  textcolor=color.white, size=size.tiny)
+if showLabels and A_short
+    label.new(bar_index, high, "A▼", style=label.style_label_down, color=color.teal,  textcolor=color.white, size=size.tiny)
+if showLabels and B_long
+    label.new(bar_index, low,  "B▲", style=label.style_label_up,   color=color.orange,textcolor=color.white, size=size.tiny)
+if showLabels and B_short
+    label.new(bar_index, high, "B▼", style=label.style_label_down, color=color.orange,textcolor=color.white, size=size.tiny)
+
+// -------- TAG IN STRATEGY TESTER -------------------------------------------
+// Uses the title bar of strategy properties; mode also visible top-right via table.
+var table modeTbl = table.new(position.top_right, 1, 1, frame_color=color.gray, frame_width=1)
+if barstate.islast
+    bgc = filterMode == "off" ? color.new(color.gray, 30) : filterMode == "block_counter" ? color.new(color.blue, 30) : color.new(color.green, 30)
+    table.cell(modeTbl, 0, 0, "v3 mode: " + filterMode, text_color=color.white, bgcolor=bgc)
