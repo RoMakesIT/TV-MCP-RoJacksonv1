@@ -1,0 +1,277 @@
+// =============================================================================
+// T2: BB + RSI Scalps [spec-exact v1.0]
+// Matches the original T2 backtest spec that produced PF 2.28 / +$26k on NQ
+// 3-min RTH only (09:30–16:00 ET), trade window 10:00–15:00
+//
+// Key differences from the v3 simplified version:
+//   - BB midline: EMA(14) not SMA(20)
+//   - BB bands: EMA(14) ± 2 × StdDev(16)
+//   - Setup A: intrabar wick through band + close back inside (not crossover)
+//   - RSI thresholds: 35 / 65 (not 30 / 70)
+//   - Setup B: %B lookback (8 bars) + VWAP direction + momentum gate
+//   - Session limit: max 3 trades/session, halt after 2 consecutive losses
+//   - No-trade buffer: entries only 10:00–15:00 ET
+//   - Band walk extension: opposite-band target when close outside band 2+ bars
+//   - Labels include entry/stop/target for agent (Kairo) to read via MCP
+// =============================================================================
+
+//@version=5
+strategy("T2: BB + RSI Scalps [spec-exact v1.0]",
+     overlay              = true,
+     initial_capital      = 25000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     pyramiding           = 0,
+     commission_type      = strategy.commission.cash_per_contract,
+     commission_value     = 0.62,
+     slippage             = 1,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+grpBB      = "Bollinger Bands"
+emaLen     = input.int(14,   "EMA length (midline + band base)", group=grpBB, minval=2)
+stdLen     = input.int(16,   "StdDev period (band width)",       group=grpBB, minval=2)
+bbMult     = input.float(2.0,"BB multiplier",                    group=grpBB, step=0.1)
+
+grpRSI     = "RSI"
+rsiLen     = input.int(14, "RSI length",               group=grpRSI, minval=2)
+rsiA_OS    = input.int(35, "Setup A RSI oversold (≤)",  group=grpRSI)
+rsiA_OB    = input.int(65, "Setup A RSI overbought (≥)",group=grpRSI)
+rsiB_min   = input.int(40, "Setup B RSI min (long ≥)",  group=grpRSI)
+rsiB_max   = input.int(60, "Setup B RSI max (short ≤)", group=grpRSI)
+
+grpSetupB  = "Setup B"
+pctBWindow = input.int(8, "%B lookback window (bars)", group=grpSetupB, minval=1)
+
+grpRisk    = "Risk"
+stopPts    = input.float(2.0, "Stop offset (index points)", group=grpRisk, step=0.25)
+
+grpSession = "Session"
+maxTrades  = input.int(3, "Max trades per RTH session",        group=grpSession, minval=1)
+maxConsLoss= input.int(2, "Consecutive losses → halt session", group=grpSession, minval=1)
+
+grpDisplay = "Display"
+showBands  = input.bool(true,  "Show BB bands + midline", group=grpDisplay)
+showVWAP   = input.bool(true,  "Show VWAP",               group=grpDisplay)
+showLabels = input.bool(true,  "Show signal labels",       group=grpDisplay)
+
+// ─── CORE INDICATORS ─────────────────────────────────────────────────────────
+midline  = ta.ema(close, emaLen)
+dev      = bbMult * ta.stdev(close, stdLen)
+upper    = midline + dev
+lower    = midline - dev
+rsi      = ta.rsi(close, rsiLen)
+atr      = ta.atr(14)
+percentB = (close - lower) / (upper - lower)
+
+// ─── SESSION DETECTION ───────────────────────────────────────────────────────
+TZ         = "America/New_York"
+isRTH      = not na(time(timeframe.period, "0930-1600", TZ))
+canTrade   = not na(time(timeframe.period, "1000-1500", TZ))   // no entries before 10:00 or after 15:00
+isRTHStart = isRTH and (na(isRTH[1]) or not isRTH[1])
+rthEnded   = not na(isRTH[1]) and isRTH[1] and not isRTH      // first bar after RTH closes
+
+// ─── VWAP (session, resets at 09:30 ET) ─────────────────────────────────────
+var float vwapNum = 0.0
+var float vwapDen = 0.0
+var float vwap    = na
+
+if isRTHStart
+    vwapNum := 0.0
+    vwapDen := 0.0
+
+if isRTH
+    tp       = (high + low + close) / 3.0
+    vwapNum += tp * volume
+    vwapDen += volume
+    vwap    := vwapNum / vwapDen
+else
+    vwap := na
+
+// ─── SESSION MANAGEMENT ──────────────────────────────────────────────────────
+var int  sessTradeCount  = 0
+var int  consLossCount   = 0
+var bool sessHalted      = false
+var int  prevClosedCount = 0   // closed-trade count at start of this RTH session
+
+if isRTHStart
+    sessTradeCount  := 0
+    consLossCount   := 0
+    sessHalted      := false
+    prevClosedCount := strategy.closedtrades
+
+// Detect new trade closes since session start; update consecutive-loss counter
+newCloses = strategy.closedtrades - prevClosedCount
+if newCloses > 0
+    for i = 0 to newCloses - 1
+        pnl = strategy.closedtrades.profit(prevClosedCount + i)
+        if pnl <= 0
+            consLossCount += 1
+            if consLossCount >= maxConsLoss
+                sessHalted := true
+        else
+            consLossCount := 0
+    prevClosedCount := strategy.closedtrades
+
+// Entry gate: RTH trade window + not halted + trade cap not hit + flat
+canEnter = canTrade and not sessHalted and sessTradeCount < maxTrades and strategy.position_size == 0
+
+// ─── BAND WALK (prior 2 bars outside band) ───────────────────────────────────
+// When price has walked outside a band for 2+ bars, extend Setup A target to opposite band
+priorShortWalk = close[1] < lower[1] and close[2] < lower[2]   // extended below lower
+priorLongWalk  = close[1] > upper[1] and close[2] > upper[2]   // extended above upper
+
+// ─── SETUP A: BAND POKE + REJECT ─────────────────────────────────────────────
+// Long: bar wicks through lower band (low ≤ lower) AND closes back inside (close > lower) + RSI oversold
+// Short: bar wicks through upper band (high ≥ upper) AND closes back inside (close < upper) + RSI overbought
+rawA_long  = low  <= lower and close >  lower and rsi <= rsiA_OS
+rawA_short = high >= upper and close <  upper and rsi >= rsiA_OB
+aAny       = rawA_long or rawA_short            // if any A signal fires, skip Setup B this bar
+
+// ─── SETUP B: MIDLINE FADE ───────────────────────────────────────────────────
+// Long: price bounced from upper band area (high %B in last N bars), now retests midline from above
+// Short: price bounced from lower band area (low %B in last N bars), now retests midline from below
+prevBarBody  = math.abs(close[1] - open[1])
+strongBull   = prevBarBody >= 0.5 * atr[1] and close[1] > open[1]   // strong up momentum last bar
+strongBear   = prevBarBody >= 0.5 * atr[1] and close[1] < open[1]   // strong down momentum last bar
+
+rawB_long  = not aAny and
+             ta.highest(percentB, pctBWindow) >= 0.80 and    // was near upper band recently
+             low  <= midline and close > midline and           // touched + closed above midline
+             rsi  >= rsiB_min and                             // not oversold
+             not strongBear and                               // no strong momentum-down prior bar
+             not na(vwap) and close > vwap                    // above VWAP (uptrend context)
+
+rawB_short = not aAny and
+             ta.lowest(percentB, pctBWindow)  <= 0.20 and    // was near lower band recently
+             high >= midline and close < midline and           // touched + closed below midline
+             rsi  <= rsiB_max and                             // not overbought
+             not strongBull and                               // no strong momentum-up prior bar
+             not na(vwap) and close < vwap                    // below VWAP (downtrend context)
+
+// ─── GATED SIGNALS ───────────────────────────────────────────────────────────
+AL = rawA_long  and canEnter
+AS = rawA_short and canEnter
+BL = rawB_long  and canEnter
+BS = rawB_short and canEnter
+
+// ─── STOP AND TARGET LEVELS ──────────────────────────────────────────────────
+// Setup A stops: signal-bar extreme ± stopPts index points
+sl_AL = low  - stopPts
+sl_AS = high + stopPts
+
+// Setup A targets: midline normally; opposite band if prior band walk
+tp_AL = priorShortWalk ? upper   : midline    // short walk → target upper band
+tp_AS = priorLongWalk  ? lower   : midline    // long walk  → target lower band
+
+// Setup B stops: worst extreme of last 4 bars ± stopPts
+sl_BL = ta.lowest(low,  4) - stopPts
+sl_BS = ta.highest(high, 4) + stopPts
+
+// Setup B targets: always the opposite band
+tp_BL = upper
+tp_BS = lower
+
+// ─── ORDERS ──────────────────────────────────────────────────────────────────
+if AL
+    strategy.entry("AL", strategy.long)
+    strategy.exit("AL-x", "AL", stop=sl_AL, limit=tp_AL)
+    sessTradeCount += 1
+
+if AS
+    strategy.entry("AS", strategy.short)
+    strategy.exit("AS-x", "AS", stop=sl_AS, limit=tp_AS)
+    sessTradeCount += 1
+
+if BL
+    strategy.entry("BL", strategy.long)
+    strategy.exit("BL-x", "BL", stop=sl_BL, limit=tp_BL)
+    sessTradeCount += 1
+
+if BS
+    strategy.entry("BS", strategy.short)
+    strategy.exit("BS-x", "BS", stop=sl_BS, limit=tp_BS)
+    sessTradeCount += 1
+
+// Forced EOD close on first bar after RTH ends (~16:00 ET)
+if rthEnded and strategy.position_size != 0
+    strategy.close_all("EOD")
+
+// ─── VISUALS ─────────────────────────────────────────────────────────────────
+plot(showBands ? midline : na, "EMA Midline", color=color.blue,   linewidth=2)
+plot(showBands ? upper   : na, "BB Upper",    color=color.orange, linewidth=1)
+plot(showBands ? lower   : na, "BB Lower",    color=color.orange, linewidth=1)
+plot(showVWAP  ? vwap    : na, "VWAP",        color=color.purple, linewidth=2)
+
+// Background: off-hours (gray) and no-entry buffer (yellow)
+bgcolor(not isRTH              ? color.new(color.gray,   94) : na, title="Off-hours")
+bgcolor(isRTH and not canTrade ? color.new(color.yellow, 96) : na, title="No-trade buffer")
+
+// Signal labels — include entry / stop / target so Kairo can read them via data_get_pine_labels
+if showLabels
+    if AL
+        label.new(bar_index, low,
+             "A▲  entry:" + str.tostring(math.round(lower,   2)) +
+             "  sl:"      + str.tostring(math.round(sl_AL,   2)) +
+             "  tp:"      + str.tostring(math.round(tp_AL,   2)),
+             style=label.style_label_up, color=color.teal, textcolor=color.white, size=size.small)
+    if AS
+        label.new(bar_index, high,
+             "A▼  entry:" + str.tostring(math.round(upper,   2)) +
+             "  sl:"      + str.tostring(math.round(sl_AS,   2)) +
+             "  tp:"      + str.tostring(math.round(tp_AS,   2)),
+             style=label.style_label_down, color=color.teal, textcolor=color.white, size=size.small)
+    if BL
+        label.new(bar_index, low,
+             "B▲  entry:" + str.tostring(math.round(midline, 2)) +
+             "  sl:"      + str.tostring(math.round(sl_BL,   2)) +
+             "  tp:"      + str.tostring(math.round(tp_BL,   2)),
+             style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+    if BS
+        label.new(bar_index, high,
+             "B▼  entry:" + str.tostring(math.round(midline, 2)) +
+             "  sl:"      + str.tostring(math.round(sl_BS,   2)) +
+             "  tp:"      + str.tostring(math.round(tp_BS,   2)),
+             style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+// ─── SESSION STATE TABLE (readable by Kairo via data_get_pine_tables) ────────
+var table t = table.new(position.top_right, 2, 6,
+     border_color=color.gray, border_width=1, bgcolor=color.new(color.black, 75))
+
+if barstate.islast
+    ok  = color.new(color.green, 30)
+    bad = color.red
+    mid = color.new(color.gray, 50)
+
+    table.cell(t, 0, 0, "T2 spec-exact",  text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.navy, 60))
+    table.cell(t, 1, 0, "v1.0",           text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy, 60))
+
+    table.cell(t, 0, 1, "Session",   text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 1, isRTH ? (canTrade ? "ACTIVE" : "BUFFER") : "CLOSED",
+               text_color=color.white,
+               bgcolor=isRTH and canTrade ? ok : isRTH ? color.new(color.yellow, 40) : mid,
+               text_size=size.small)
+
+    table.cell(t, 0, 2, "Trades",    text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(sessTradeCount) + "/" + str.tostring(maxTrades),
+               text_color=color.white,
+               bgcolor=sessTradeCount >= maxTrades ? bad : ok,
+               text_size=size.small)
+
+    table.cell(t, 0, 3, "Consec L",  text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(consLossCount) + (sessHalted ? " HALT" : ""),
+               text_color=color.white,
+               bgcolor=sessHalted ? bad : consLossCount > 0 ? color.new(color.orange, 30) : mid,
+               text_size=size.small)
+
+    table.cell(t, 0, 4, "Can Enter", text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 4, canEnter ? "YES" : "NO",
+               text_color=color.white,
+               bgcolor=canEnter ? ok : bad,
+               text_size=size.small)
+
+    table.cell(t, 0, 5, "VWAP",      text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 5, na(vwap) ? "N/A" : str.tostring(math.round(vwap, 2)),
+               text_color=close > vwap ? color.new(color.green, 20) : color.new(color.red, 20),
+               text_size=size.small)

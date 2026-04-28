@@ -1,0 +1,502 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+// MNQ CORE — Webhook v7  (3-minute, spec-exact T2)
+// ───────────────────────────────────────────────────────────────────────────────
+// Changes from v6:
+//   • T2 replaced with spec-exact logic (Databento-validated: PF 2.28 / +$26k, 2yr)
+//   • BB: EMA(14) midline + StdDev(16) × 2.0  (was SMA(20) × 1.8)
+//   • Setup A: intrabar wick-through + close back inside + RSI 35/65
+//   • Setup B: %B lookback(8) + VWAP direction + prior-bar momentum gate
+//   • Band walk extension: opposite-band target when closed outside 2+ bars
+//   • Trade window gate: 10:00–15:00 ET (T2 not emitted outside window)
+//   • Session trade count / consecutive-loss halt → Kairo governor (not Pine)
+//   • All zone / VWAP / mode / DI / webhook logic unchanged from v6
+// ═══════════════════════════════════════════════════════════════════════════════
+
+indicator("MNQ Core — Webhook v7", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ─── INPUTS ────────────────────────────────────────────────────────────────────
+g_rth   = "RTH Gating"
+tz      = input.string("America/New_York", "Timezone", group=g_rth)
+sess_s  = input.session("0930-1600", "RTH Session", group=g_rth)
+
+g_vp    = "Volume Profile"
+vp_bins = input.int(50, "VP bins", minval=20, maxval=200, group=g_vp)
+vp_va   = input.float(0.70, "Value-area %", step=0.05, minval=0.5, maxval=0.9, group=g_vp)
+
+g_mode  = "Mode / DI"
+te_lb   = input.int(50, "TE lookback",         group=g_mode)
+init_lb = input.int(20, "Initiative lookback", group=g_mode)
+
+g_zone  = "Zones"
+zw          = input.float(6.0,  "Zone half-width (pts)", group=g_zone)
+cluster_gap = input.float(10.0, "Cluster gap (pts)",     group=g_zone)
+sw_days     = input.int(5, "Swing lookback (days)", group=g_zone,
+     tooltip="Auto-scales to bars based on chart timeframe")
+
+g_t2    = "T2 Signal (spec-exact)"
+ema_len  = input.int(14,   "EMA length (midline)",          group=g_t2, minval=2)
+std_len  = input.int(16,   "StdDev period (band width)",    group=g_t2, minval=2)
+bb_mult  = input.float(2.0,"BB multiplier",                 group=g_t2, step=0.1)
+rsi_len  = input.int(14,   "RSI length",                   group=g_t2, minval=2)
+rsiA_OS  = input.int(35,   "Setup A RSI oversold ≤",        group=g_t2)
+rsiA_OB  = input.int(65,   "Setup A RSI overbought ≥",      group=g_t2)
+rsiB_min = input.int(40,   "Setup B RSI min (long ≥)",      group=g_t2)
+rsiB_max = input.int(60,   "Setup B RSI max (short ≤)",     group=g_t2)
+pctB_win = input.int(8,    "%B lookback window (bars)",     group=g_t2, minval=1)
+stop_pts = input.float(2.0,"Stop offset (index pts)",       group=g_t2, step=0.25)
+
+g_gate  = "Quality Gates"
+min_confluence = input.int(2, "Min zone confluence for T2 emit", minval=1, maxval=10,
+     group=g_gate, tooltip="Pine-level filter — below this, no T2 emitted")
+
+g_out   = "Webhook"
+emit    = input.bool(true, "Emit alert JSON on bar close", group=g_out)
+show_vp = input.bool(true, "Plot VWAP / POC / VAH / VAL",  group=g_out)
+show_z  = input.bool(true, "Plot zone band",               group=g_out)
+
+// ─── AUTO-SCALE SWING LOOKBACK TO CHART TIMEFRAME ──────────────────────────────
+tf_mins      = timeframe.in_seconds() / 60.0
+bars_per_day = tf_mins > 0 ? math.floor(390.0 / tf_mins) : 130   // default 130 = 3-min
+sw_lookback  = bars_per_day * sw_days
+
+// ─── RTH GATING ───────────────────────────────────────────────────────────────
+in_rth  = not na(time(timeframe.period, sess_s, tz))
+rth_new = in_rth and not in_rth[1]
+
+yr = year(time, tz)
+mo = month(time, tz)
+dy = dayofmonth(time, tz)
+session_id = str.tostring(yr) + "-" +
+     (mo < 10 ? "0" : "") + str.tostring(mo) + "-" +
+     (dy < 10 ? "0" : "") + str.tostring(dy)
+
+// ─── VWAP + σ BANDS (session anchored) ────────────────────────────────────────
+var float pv_sum  = 0.0
+var float v_sum   = 0.0
+var float pv2_sum = 0.0
+
+if rth_new
+    pv_sum  := 0.0
+    v_sum   := 0.0
+    pv2_sum := 0.0
+
+tp = (high + low + close) / 3.0
+
+if in_rth
+    pv_sum := pv_sum + tp * volume
+    v_sum  := v_sum  + volume
+
+vwap_v = v_sum > 0 ? pv_sum / v_sum : close
+
+if in_rth and v_sum > 0
+    pv2_sum := pv2_sum + math.pow(tp - vwap_v, 2) * volume
+
+vwap_std   = v_sum > 0 ? math.sqrt(pv2_sum / v_sum) : 0.0
+vwap_1s_up = vwap_v + vwap_std
+vwap_1s_dn = vwap_v - vwap_std
+vwap_2s_dn = vwap_v - 2.0 * vwap_std
+vwap_dev   = close - vwap_v
+
+// ─── ATR ──────────────────────────────────────────────────────────────────────
+atr14 = ta.atr(14)
+
+// ─── INITIAL BALANCE (first 60m of RTH) ───────────────────────────────────────
+var int   ib_start = na
+var float ib_hi    = na
+var float ib_lo    = na
+var float rth_open = na
+
+if rth_new
+    ib_start := time
+    ib_hi    := high
+    ib_lo    := low
+    rth_open := open
+else if in_rth and not na(ib_start) and (time - ib_start) < 3600000
+    ib_hi := math.max(nz(ib_hi, high), high)
+    ib_lo := math.min(nz(ib_lo, low),  low)
+
+ib_complete = not na(ib_start) and (time - ib_start) >= 3600000
+
+// ─── PRIOR DAY LEVELS ─────────────────────────────────────────────────────────
+prev_hi    = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+prev_lo    = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+prev_close = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+
+// ─── VOLUME PROFILE — POC / VAH / VAL ─────────────────────────────────────────
+var array<float> sess_tp  = array.new<float>(0)
+var array<float> sess_vol = array.new<float>(0)
+
+if rth_new
+    array.clear(sess_tp)
+    array.clear(sess_vol)
+
+if in_rth
+    array.push(sess_tp,  tp)
+    array.push(sess_vol, volume)
+
+var float poc_v = na
+var float vah_v = na
+var float val_v = na
+
+n_sess = array.size(sess_tp)
+
+if in_rth and n_sess > 5
+    tp_lo = array.min(sess_tp)
+    tp_hi = array.max(sess_tp)
+    rng   = tp_hi - tp_lo
+    if rng > 0
+        bin_vol = array.new<float>(vp_bins, 0.0)
+        bin_ctr = array.new<float>(vp_bins, 0.0)
+        for i = 0 to vp_bins - 1
+            array.set(bin_ctr, i, tp_lo + (i + 0.5) * rng / vp_bins)
+        for j = 0 to n_sess - 1
+            t   = array.get(sess_tp,  j)
+            v   = array.get(sess_vol, j)
+            idx = math.min(vp_bins - 1, math.max(0, int(math.floor((t - tp_lo) / rng * vp_bins))))
+            array.set(bin_vol, idx, array.get(bin_vol, idx) + v)
+        poc_idx = 0
+        poc_max = -1.0
+        for i = 0 to vp_bins - 1
+            bv = array.get(bin_vol, i)
+            if bv > poc_max
+                poc_max := bv
+                poc_idx := i
+        poc_v := array.get(bin_ctr, poc_idx)
+        total  = array.sum(bin_vol)
+        target = total * vp_va
+        lo_i   = poc_idx
+        hi_i   = poc_idx
+        acc    = array.get(bin_vol, poc_idx)
+        while acc < target and (lo_i > 0 or hi_i < vp_bins - 1)
+            el = lo_i > 0           ? array.get(bin_vol, lo_i - 1) : 0.0
+            eh = hi_i < vp_bins - 1 ? array.get(bin_vol, hi_i + 1) : 0.0
+            if el >= eh and lo_i > 0
+                lo_i := lo_i - 1
+                acc  := acc + array.get(bin_vol, lo_i)
+            else if hi_i < vp_bins - 1
+                hi_i := hi_i + 1
+                acc  := acc + array.get(bin_vol, hi_i)
+            else
+                break
+        val_v := array.get(bin_ctr, lo_i)
+        vah_v := array.get(bin_ctr, hi_i)
+
+// ─── POC MIGRATION ─────────────────────────────────────────────────────────────
+poc_ref       = nz(poc_v[30], poc_v)
+poc_delta     = poc_v - poc_ref
+poc_migrating = not na(poc_v) and not na(poc_ref) and math.abs(poc_delta) > close * 0.001
+poc_migration = poc_migrating ? (poc_delta > 0 ? "up" : "down") : "flat"
+
+// ─── TREND EFFICIENCY ──────────────────────────────────────────────────────────
+net_move = math.abs(close - close[te_lb])
+path_sum = 0.0
+for i = 0 to te_lb - 1
+    path_sum := path_sum + math.abs(close[i] - close[i+1])
+te = path_sum > 0 ? net_move / path_sum : 0.0
+
+// ─── INITIATIVE SCORE ─────────────────────────────────────────────────────────
+up_vol = 0.0
+dn_vol = 0.0
+for i = 0 to init_lb - 1
+    if close[i] > open[i]
+        up_vol := up_vol + volume[i]
+    else
+        dn_vol := dn_vol + volume[i]
+tot_v = up_vol + dn_vol
+vr    = tot_v > 0 ? (up_vol - dn_vol) / tot_v : 0.0
+ret   = init_lb > 1 ? close / close[init_lb - 1] - 1.0 : 0.0
+init_score = math.max(-1.0, math.min(1.0,
+     vr * 0.6 + math.max(-1.0, math.min(1.0, ret * 100.0)) * 0.4))
+
+// ─── DI SCORE ─────────────────────────────────────────────────────────────────
+inv_eff  = 1.0 - te
+poc_flat = poc_migrating ? 0.0 : 1.0
+cross_up = ta.crossover(close, vwap_v)
+cross_dn = ta.crossunder(close, vwap_v)
+vwap_crosses = math.sum((cross_up or cross_dn) ? 1 : 0, 30)
+vwap_magnet  = math.min(1.0, vwap_crosses / 10.0)
+hi20 = ta.highest(high[1], 20)
+lo20 = ta.lowest(low[1],  20)
+fb_up = high >= hi20 and close < open
+fb_dn = low  <= lo20 and close > open
+fb_count = math.sum((fb_up or fb_dn) ? 1 : 0, 20)
+fb_norm  = math.min(1.0, fb_count / 4.0)
+vol_ref   = ta.sma(volume, 20)
+vol_score = vol_ref > 0 ? math.min(1.0, volume / vol_ref / 2.0) : 0.5
+di_score = vol_score * 25.0 + inv_eff * 25.0 + poc_flat * 20.0 +
+           vwap_magnet * 15.0 + fb_norm * 15.0
+
+// ─── MODE CLASSIFIER ───────────────────────────────────────────────────────────
+market_mode = "Balance"
+if te > 0.40 and math.abs(init_score) > 0.40 and di_score < 50
+    market_mode := init_score > 0 ? "Trend Up" : "Trend Down"
+else if te > 0.25 and math.abs(init_score) > 0.25 and di_score < 55
+    market_mode := "Trend Developing"
+else if di_score >= 65 and te < 0.25
+    market_mode := "Balance"
+else if te >= 0.30 and di_score >= 55
+    market_mode := "Transition"
+else
+    market_mode := "Balance"
+
+// ─── CONFLUENCE ZONE ENGINE ────────────────────────────────────────────────────
+swing_hi_5d = ta.highest(high, sw_lookback)
+swing_lo_5d = ta.lowest(low,  sw_lookback)
+sw_range    = swing_hi_5d - swing_lo_5d
+fib_50      = (swing_hi_5d + swing_lo_5d) / 2.0
+fib_618_hi  = swing_hi_5d - 0.618 * sw_range
+fib_618_lo  = swing_lo_5d + 0.618 * sw_range
+
+anc_p = array.new<float>(0)
+anc_t = array.new<string>(0)
+
+if not na(prev_hi)
+    array.push(anc_p, prev_hi)
+    array.push(anc_t, close < prev_hi ? "supply" : "demand")
+if not na(prev_lo)
+    array.push(anc_p, prev_lo)
+    array.push(anc_t, close > prev_lo ? "demand" : "supply")
+if not na(prev_close)
+    array.push(anc_p, prev_close)
+    array.push(anc_t, close < prev_close ? "supply" : "demand")
+if ib_complete and not na(ib_hi)
+    array.push(anc_p, ib_hi)
+    array.push(anc_t, "supply")
+if ib_complete and not na(ib_lo)
+    array.push(anc_p, ib_lo)
+    array.push(anc_t, "demand")
+if not na(vah_v)
+    array.push(anc_p, vah_v)
+    array.push(anc_t, "supply")
+if not na(val_v)
+    array.push(anc_p, val_v)
+    array.push(anc_t, "demand")
+array.push(anc_p, fib_50)
+array.push(anc_t, close < fib_50 ? "supply" : "demand")
+array.push(anc_p, fib_618_hi)
+array.push(anc_t, close < fib_618_hi ? "supply" : "demand")
+array.push(anc_p, fib_618_lo)
+array.push(anc_t, close > fib_618_lo ? "demand" : "supply")
+
+n_anc = array.size(anc_p)
+
+var float z_top        = na
+var float z_bot        = na
+var string z_type      = "none"
+var int   z_confluence = 1
+
+if n_anc > 0
+    best_score = 0
+    best_top   = array.get(anc_p, 0) + zw / 2.0
+    best_bot   = array.get(anc_p, 0) - zw / 2.0
+    best_type  = array.get(anc_t, 0)
+    best_dist  = math.abs(array.get(anc_p, 0) - close)
+
+    for i = 0 to n_anc - 1
+        p_i     = array.get(anc_p, i)
+        score_i = 0
+        c_lo    = p_i
+        c_hi    = p_i
+        sup_cnt = 0
+
+        for j = 0 to n_anc - 1
+            p_j = array.get(anc_p, j)
+            if math.abs(p_j - p_i) <= cluster_gap
+                score_i := score_i + 1
+                c_lo    := math.min(c_lo, p_j)
+                c_hi    := math.max(c_hi, p_j)
+                if array.get(anc_t, j) == "supply"
+                    sup_cnt := sup_cnt + 1
+
+        c_top_i  = c_hi + zw / 2.0
+        c_bot_i  = c_lo - zw / 2.0
+        c_mid_i  = (c_hi + c_lo) / 2.0
+        c_dist_i = math.abs(c_mid_i - close)
+        c_type_i = sup_cnt >= (score_i - sup_cnt) ? "supply" : "demand"
+
+        if score_i > best_score or (score_i == best_score and c_dist_i < best_dist)
+            best_score := score_i
+            best_top   := c_top_i
+            best_bot   := c_bot_i
+            best_type  := c_type_i
+            best_dist  := c_dist_i
+
+    z_top        := best_top
+    z_bot        := best_bot
+    z_type       := best_type
+    z_confluence := best_score
+
+// ─── ZONE FRESHNESS + INVALIDATION ────────────────────────────────────────────
+var bool  zone_touched     = false
+var float touched_at_mid   = na
+var bool  zone_invalidated = false
+
+z_mid = not na(z_top) and not na(z_bot) ? (z_top + z_bot) / 2.0 : na
+
+if rth_new
+    zone_touched     := false
+    touched_at_mid   := na
+    zone_invalidated := false
+
+if not na(z_top) and not na(z_bot) and not na(atr14)
+    if z_type == "supply" and close > z_top + 0.5 * atr14
+        zone_invalidated := true
+    if z_type == "demand" and close < z_bot - 0.5 * atr14
+        zone_invalidated := true
+
+if not na(z_top) and not na(z_bot) and low <= z_top and high >= z_bot
+    zone_touched   := true
+    touched_at_mid := z_mid
+else if zone_touched and not na(touched_at_mid) and not na(z_mid) and math.abs(z_mid - touched_at_mid) > cluster_gap
+    zone_touched     := false
+    touched_at_mid   := na
+    zone_invalidated := false
+
+zone_fresh = not zone_touched and not zone_invalidated
+
+zone_test_count = 1
+
+// ─── T2 SIGNAL — SPEC-EXACT ───────────────────────────────────────────────────
+// EMA-based Bollinger Bands (matches validated Databento spec)
+bb_mid    = ta.ema(close, ema_len)
+bb_dev_v  = bb_mult * ta.stdev(close, std_len)
+bb_up     = bb_mid + bb_dev_v
+bb_dn     = bb_mid - bb_dev_v
+rsi_v     = ta.rsi(close, rsi_len)
+percent_b = (close - bb_dn) / (bb_up - bb_dn)
+
+// Trade window: 10:00–15:00 ET (entries only; RTH outer session still active)
+can_trade = not na(time(timeframe.period, "1000-1500", tz))
+
+// Band walk detection: 2 consecutive closes outside band → extend target to opposite band
+prior_short_walk = close[1] < bb_dn[1] and close[2] < bb_dn[2]
+prior_long_walk  = close[1] > bb_up[1] and close[2] > bb_up[2]
+
+// Setup A — intrabar wick-through + close back inside band
+rawA_long  = low  <= bb_dn and close >  bb_dn and rsi_v <= rsiA_OS
+rawA_short = high >= bb_up and close <  bb_up and rsi_v >= rsiA_OB
+a_any      = rawA_long or rawA_short
+
+// Setup B — midline fade with VWAP direction + prior-bar momentum gate
+prev_body   = math.abs(close[1] - open[1])
+strong_bull = prev_body >= 0.5 * atr14[1] and close[1] > open[1]
+strong_bear = prev_body >= 0.5 * atr14[1] and close[1] < open[1]
+
+rawB_long  = not a_any and
+             ta.highest(percent_b, pctB_win) >= 0.80 and
+             low  <= bb_mid and close > bb_mid and
+             rsi_v >= rsiB_min and not strong_bear and
+             not na(vwap_v) and close > vwap_v
+
+rawB_short = not a_any and
+             ta.lowest(percent_b, pctB_win)  <= 0.20 and
+             high >= bb_mid and close < bb_mid and
+             rsi_v <= rsiB_max and not strong_bull and
+             not na(vwap_v) and close < vwap_v
+
+// Final gate: trade window + zone confluence
+t2_long  = (rawA_long  or rawB_long)  and can_trade and z_confluence >= min_confluence
+t2_short = (rawA_short or rawB_short) and can_trade and z_confluence >= min_confluence
+
+t2_signal    = t2_long or t2_short
+t2_direction = t2_long ? "long" : t2_short ? "short" : "none"
+
+// Tier label preserved for agent context
+t2_tier = (rawA_long or rawA_short) ? "strict" :
+          (rawB_long or rawB_short) ? "continuation" : "none"
+
+// Stop levels
+sl_A_long  = low  - stop_pts
+sl_A_short = high + stop_pts
+sl_B_long  = ta.lowest(low,  4) - stop_pts
+sl_B_short = ta.highest(high, 4) + stop_pts
+
+// Target levels (band walk extends Setup A target to opposite band)
+tp_A_long  = prior_short_walk ? bb_up : bb_mid
+tp_A_short = prior_long_walk  ? bb_dn : bb_mid
+tp_B_long  = bb_up
+tp_B_short = bb_dn
+
+t2_entry      = t2_long ? close : t2_short ? close : na
+t2_stop_long  = rawA_long  ? sl_A_long  : sl_B_long
+t2_stop_short = rawA_short ? sl_A_short : sl_B_short
+t2_stop       = t2_long ? t2_stop_long : t2_short ? t2_stop_short : na
+t2_tgt_long   = rawA_long  ? tp_A_long  : tp_B_long
+t2_tgt_short  = rawA_short ? tp_A_short : tp_B_short
+t2_target     = t2_long ? t2_tgt_long : t2_short ? t2_tgt_short : na
+
+// ─── PLOTS ────────────────────────────────────────────────────────────────────
+plot(show_vp and in_rth ? vwap_v     : na, "VWAP",    color=color.new(color.orange, 0),  linewidth=2)
+plot(show_vp and in_rth ? vwap_1s_up : na, "VWAP+1σ", color=color.new(color.orange, 60))
+plot(show_vp and in_rth ? vwap_1s_dn : na, "VWAP-1σ", color=color.new(color.orange, 60))
+plot(show_vp and in_rth ? vwap_2s_dn : na, "VWAP-2σ", color=color.new(color.red,    60))
+plot(show_vp and in_rth ? poc_v      : na, "POC",     color=color.new(color.yellow, 0),  linewidth=2)
+plot(show_vp and in_rth ? vah_v      : na, "VAH",     color=color.new(color.aqua,   40))
+plot(show_vp and in_rth ? val_v      : na, "VAL",     color=color.new(color.aqua,   40))
+
+z_opacity = z_confluence >= 3 ? 55 : z_confluence == 2 ? 72 : 88
+z_col_s = color.new(color.red,   z_opacity)
+z_col_d = color.new(color.green, z_opacity)
+p_top = plot(show_z and in_rth ? z_top : na, "Zone top",
+     color=z_type == "supply" ? z_col_s : z_col_d)
+p_bot = plot(show_z and in_rth ? z_bot : na, "Zone bot",
+     color=z_type == "supply" ? z_col_s : z_col_d)
+fill(p_top, p_bot,
+     color=z_type == "supply" ? color.new(color.red, 92) : color.new(color.green, 92))
+
+plotshape(t2_long,  "T2 LONG",  location=location.belowbar, style=shape.triangleup,
+     color=color.lime, size=size.small)
+plotshape(t2_short, "T2 SHORT", location=location.abovebar, style=shape.triangledown,
+     color=color.red,  size=size.small)
+
+// ─── WEBHOOK JSON ─────────────────────────────────────────────────────────────
+nf(v) => na(v) ? "null" : str.tostring(v, "#.##")
+nb(v) => v ? "true" : "false"
+qs(v) => "\"" + v + "\""
+
+ts_str = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ssZ", tz)
+
+payload =
+     "{" +
+     "\"timestamp\":"              + qs(ts_str)                    + "," +
+     "\"session\":"                + qs(session_id)                + "," +
+     "\"ib_complete\":"            + nb(ib_complete)               + "," +
+     "\"market_mode\":"            + qs(market_mode)               + "," +
+     "\"di_score\":"               + nf(di_score)                  + "," +
+     "\"price_current\":"          + nf(close)                     + "," +
+     "\"price_open\":"             + nf(rth_open)                  + "," +
+     "\"price_ib_high\":"          + nf(ib_hi)                     + "," +
+     "\"price_ib_low\":"           + nf(ib_lo)                     + "," +
+     "\"price_prev_high\":"        + nf(prev_hi)                   + "," +
+     "\"price_prev_low\":"         + nf(prev_lo)                   + "," +
+     "\"price_prev_close\":"       + nf(prev_close)                + "," +
+     "\"vwap\":"                   + nf(vwap_v)                    + "," +
+     "\"vwap_dev_pts\":"           + nf(vwap_dev)                  + "," +
+     "\"vwap_1sig_upper\":"        + nf(vwap_1s_up)                + "," +
+     "\"vwap_1sig_lower\":"        + nf(vwap_1s_dn)                + "," +
+     "\"vwap_2sig_lower\":"        + nf(vwap_2s_dn)                + "," +
+     "\"atr14\":"                  + nf(atr14)                     + "," +
+     "\"poc\":"                    + nf(poc_v)                     + "," +
+     "\"vah\":"                    + nf(vah_v)                     + "," +
+     "\"val\":"                    + nf(val_v)                     + "," +
+     "\"poc_migration\":"          + qs(poc_migration)             + "," +
+     "\"zone_top\":"               + nf(z_top)                     + "," +
+     "\"zone_bottom\":"            + nf(z_bot)                     + "," +
+     "\"zone_type\":"              + qs(z_type)                    + "," +
+     "\"zone_fresh\":"             + nb(zone_fresh)                + "," +
+     "\"zone_test_count\":"        + str.tostring(zone_test_count) + "," +
+     "\"zone_confluence_score\":"  + str.tostring(z_confluence)    + "," +
+     "\"zone_invalidated\":"       + nb(zone_invalidated)          + "," +
+     "\"t2_signal\":"              + nb(t2_signal)                 + "," +
+     "\"t2_direction\":"           + qs(t2_direction)              + "," +
+     "\"t2_tier\":"                + qs(t2_tier)                   + "," +
+     "\"t2_entry\":"               + nf(t2_entry)                  + "," +
+     "\"t2_stop\":"                + nf(t2_stop)                   + "," +
+     "\"t2_target\":"              + nf(t2_target)                 + "," +
+     "\"tf_minutes\":"             + str.tostring(tf_mins)         +
+     "}"
+
+if emit and in_rth and barstate.isconfirmed
+    alert(payload, alert.freq_once_per_bar_close)
